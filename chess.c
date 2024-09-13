@@ -4,7 +4,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <time.h>
-#include <conio.h> // For _getch() function
+#include <conio.h> 
 #include <windows.h>
 
 #define BOARD_SIZE 8
@@ -59,6 +59,8 @@ bool isInCheck(GameState* state, bool isWhiteKing);
 bool isCheckmate(GameState* state);
 bool isKingCapturable(GameState* state, bool isWhiteKing);
 void promotePawn(GameState* state, int row, int col);
+bool doesMovePutKingInCheck(GameState* state, int fromRow, int fromCol, int toRow, int toCol);
+bool isSquareAttacked(GameState* state, int row, int col, bool byWhite);
 void getAIMove(GameState* state, int *fromRow, int *fromCol, int *toRow, int *toCol);
 void getAllValidMoves(GameState* state, int moves[][4], int *moveCount);
 char getYesNoResponse();
@@ -71,13 +73,11 @@ bool isDraw(GameState* state);
 int moveValue(GameState* state, int move[4]);
 int compareMove(const void* a, const void* b);
 bool isValidCastling(GameState* state, int fromRow, int fromCol, int toRow, int toCol);
-bool isSquareAttacked(GameState* state, int row, int col, bool isWhite);
 void updateCastlingRights(GameState* state, int fromRow, int fromCol, int toRow, int toCol);
 int evaluateBoard(GameState* state);
 int evaluatePawnStructure(GameState* state);
 int evaluateKingSafety(GameState* state);
 bool isPieceUnderAttack(GameState* state, int row, int col);
-
 // Add these global variables at the top of the file
 int cursorRow = 0;
 int cursorCol = 0;
@@ -268,16 +268,53 @@ bool isValidMove(GameState* state, int fromRow, int fromCol, int toRow, int toCo
         default:
             return false;
     }
+    if (doesMovePutKingInCheck(state, fromRow, fromCol, toRow, toCol)) {
+        return false;
+    }
+    
+    return true;
 }
-
 void makeMove(GameState* state, int fromRow, int fromCol, int toRow, int toCol) {
     char piece = state->board[fromRow][fromCol];
     state->board[toRow][toCol] = state->board[fromRow][fromCol];
     state->board[fromRow][fromCol] = EMPTY;
     
+    // Handle castling
+    if (toupper(piece) == WHITE_KING && abs(fromCol - toCol) == 2) {
+        int rookFromCol = (toCol > fromCol) ? 7 : 0;
+        int rookToCol = (toCol > fromCol) ? toCol - 1 : toCol + 1;
+        state->board[toRow][rookToCol] = state->board[fromRow][rookFromCol];
+        state->board[fromRow][rookFromCol] = EMPTY;
+    }
+    
     // Handle en passant capture
     if (toupper(piece) == WHITE_PAWN && toCol == state->enPassantTargetCol && toRow == state->enPassantTargetRow) {
         state->board[fromRow][toCol] = EMPTY;
+    }
+    
+    // Update castling rights
+    updateCastlingRights(state, fromRow, fromCol, toRow, toCol);
+    
+    // Reset en passant target
+    state->enPassantTargetRow = -1;
+    state->enPassantTargetCol = -1;
+    
+    // Set en passant target for pawn double move
+    if (toupper(piece) == WHITE_PAWN && abs(fromRow - toRow) == 2) {
+        state->enPassantTargetRow = (fromRow + toRow) / 2;
+        state->enPassantTargetCol = toCol;
+    }
+    
+    // Update halfmove clock
+    if (piece == WHITE_PAWN || piece == BLACK_PAWN || state->board[toRow][toCol] != EMPTY) {
+        state->halfmoveClock = 0;
+    } else {
+        state->halfmoveClock++;
+    }
+    
+    // Update fullmove number
+    if (!state->isWhiteTurn) {
+        state->fullmoveNumber++;
     }
 }
     // Update castling rights
@@ -286,24 +323,24 @@ void updateCastlingRights(GameState* state, int fromRow, int fromCol, int toRow,
     char piece = state->board[fromRow][fromCol];
     
     if (piece == WHITE_KING) {
-        state->whiteCastleKingside = false;
-        state->whiteCastleQueenside = false;
+        state->canWhiteCastleKingside = false;
+        state->canWhiteCastleQueenside = false;
     } else if (piece == BLACK_KING) {
-        state->blackCastleKingside = false;
-        state->blackCastleQueenside = false;
+        state->canBlackCastleKingside = false;
+        state->canBlackCastleQueenside = false;
     } else if (piece == WHITE_ROOK) {
-        if (fromRow == 7 && fromCol == 0) state->whiteCastleQueenside = false;
-        if (fromRow == 7 && fromCol == 7) state->whiteCastleKingside = false;
+        if (fromRow == 7 && fromCol == 0) state->canWhiteCastleQueenside = false;
+        if (fromRow == 7 && fromCol == 7) state->canWhiteCastleKingside = false;
     } else if (piece == BLACK_ROOK) {
-        if (fromRow == 0 && fromCol == 0) state->blackCastleQueenside = false;
-        if (fromRow == 0 && fromCol == 7) state->blackCastleKingside = false;
+        if (fromRow == 0 && fromCol == 0) state->canBlackCastleQueenside = false;
+        if (fromRow == 0 && fromCol == 7) state->canBlackCastleKingside = false;
     }
     
     // Check if a rook is captured
-    if (toRow == 0 && toCol == 0) state->blackCastleQueenside = false;
-    if (toRow == 0 && toCol == 7) state->blackCastleKingside = false;
-    if (toRow == 7 && toCol == 0) state->whiteCastleQueenside = false;
-    if (toRow == 7 && toCol == 7) state->whiteCastleKingside = false;
+    if (toRow == 0 && toCol == 0) state->canBlackCastleQueenside = false;
+    if (toRow == 0 && toCol == 7) state->canBlackCastleKingside = false;
+    if (toRow == 7 && toCol == 0) state->canWhiteCastleQueenside = false;
+    if (toRow == 7 && toCol == 7) state->canWhiteCastleKingside = false;
 }
 
 bool isValidCastling(GameState* state, int fromRow, int fromCol, int toRow, int toCol) {
@@ -326,6 +363,7 @@ bool isValidCastling(GameState* state, int fromRow, int fromCol, int toRow, int 
         return false;
     }
 
+
     // Check if the squares between the king and rook are empty
     int rookCol = isKingSide ? 7 : 0;
     int step = isKingSide ? 1 : -1;
@@ -347,11 +385,11 @@ bool isValidCastling(GameState* state, int fromRow, int fromCol, int toRow, int 
 
     // Check if castling rights are available
     if (isWhite) {
-        if (isKingSide && !state->whiteCastleKingside) return false;
-        if (!isKingSide && !state->whiteCastleQueenside) return false;
+        if (isKingSide && !state->canWhiteCastleKingside) return false;
+        if (!isKingSide && !state->canWhiteCastleQueenside) return false;
     } else {
-        if (isKingSide && !state->blackCastleKingside) return false;
-        if (!isKingSide && !state->blackCastleQueenside) return false;
+         if (isKingSide && !state->canBlackCastleKingside) return false;
+        if (!isKingSide && !state->canBlackCastleQueenside) return false;
     }
 
     return true;
@@ -450,7 +488,7 @@ bool isValidKingMove(GameState* state, int fromRow, int fromCol, int toRow, int 
     }
 
     // Check for castling
-    if (toupper(state->board[fromRow][fromCol]) == WHITE_KING && abs(fromCol - toCol) == 2) {
+    if (abs(fromCol - toCol) == 2 && fromRow == toRow) {
         return isValidCastling(state, fromRow, fromCol, toRow, toCol);
     }
 
@@ -491,13 +529,52 @@ bool isKingCapturable(GameState* state, bool isWhiteKing) {
     
     return false;
 }
+bool isSquareAttacked(GameState* state, int row, int col, bool byWhite) {
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            char piece = state->board[i][j];
+            if ((byWhite && isupper(piece)) || (!byWhite && islower(piece))) {
+                // Temporarily change turn to check move validity
+                bool originalTurn = state->isWhiteTurn;
+                state->isWhiteTurn = byWhite;
+                bool validMove = isValidMove(state, i, j, row, col);
+                state->isWhiteTurn = originalTurn;
+                if (validMove) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
 
 bool isInCheck(GameState* state, bool isWhiteKing) {
-    return isKingCapturable(state, isWhiteKing);
+    int kingRow = -1, kingCol = -1;
+    char kingPiece = isWhiteKing ? WHITE_KING : BLACK_KING;
+    
+    // Find the king's position
+    for (int i = 0; i < BOARD_SIZE && kingRow == -1; i++) {
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            if (state->board[i][j] == kingPiece) {
+                kingRow = i;
+                kingCol = j;
+                break;
+            }
+        }
+    }
+    
+    if (kingRow == -1 || kingCol == -1) {
+        // King not found, this shouldn't happen in a valid game state
+        return false;
+    }
+    
+    return isSquareAttacked(state, kingRow, kingCol, !isWhiteKing);
 }
 
 bool isCheckmate(GameState* state) {
-    if (!isInCheck(state, state->isWhiteTurn)) {
+    bool isWhiteKing = state->isWhiteTurn;
+    
+    if (!isInCheck(state, isWhiteKing)) {
         return false;
     }
 
@@ -505,7 +582,7 @@ bool isCheckmate(GameState* state) {
     for (int fromRow = 0; fromRow < BOARD_SIZE; fromRow++) {
         for (int fromCol = 0; fromCol < BOARD_SIZE; fromCol++) {
             char piece = state->board[fromRow][fromCol];
-            if ((state->isWhiteTurn && isupper(piece)) || (!state->isWhiteTurn && islower(piece))) {
+            if ((isWhiteKing && isupper(piece)) || (!isWhiteKing && islower(piece))) {
                 for (int toRow = 0; toRow < BOARD_SIZE; toRow++) {
                     for (int toCol = 0; toCol < BOARD_SIZE; toCol++) {
                         if (isValidMove(state, fromRow, fromCol, toRow, toCol)) {
@@ -515,7 +592,7 @@ bool isCheckmate(GameState* state) {
                             state->board[fromRow][fromCol] = EMPTY;
 
                             // Check if the king is still in check
-                            bool stillInCheck = isInCheck(state, state->isWhiteTurn);
+                                                        bool stillInCheck = isInCheck(state, isWhiteKing);
 
                             // Undo the move
                             state->board[fromRow][fromCol] = state->board[toRow][toCol];
@@ -883,10 +960,7 @@ void getAIMove(GameState* state, int *fromRow, int *fromCol, int *toRow, int *to
             if ((state->isWhiteTurn && isupper(piece)) || (!state->isWhiteTurn && islower(piece))) {
                 for (int tr = 0; tr < BOARD_SIZE; tr++) {
                     for (int tc = 0; tc < BOARD_SIZE; tc++) {
-                        GameState tempState;
-                        memcpy(tempState.board, state->board, sizeof(tempState.board));
-                        tempState.isWhiteTurn = state->isWhiteTurn;
-                        if (isValidMove(&tempState, fr, fc, tr, tc)) {
+                        if (isValidMove(state, fr, fc, tr, tc) && !doesMovePutKingInCheck(state, fr, fc, tr, tc)) {
                             moves[moveCount][0] = fr;
                             moves[moveCount][1] = fc;
                             moves[moveCount][2] = tr;
@@ -939,6 +1013,20 @@ void getAIMove(GameState* state, int *fromRow, int *fromCol, int *toRow, int *to
     *fromCol = moves[bestMoveIndex][1];
     *toRow = moves[bestMoveIndex][2];
     *toCol = moves[bestMoveIndex][3];
+}
+
+bool doesMovePutKingInCheck(GameState* state, int fromRow, int fromCol, int toRow, int toCol) {
+    char tempPiece = state->board[toRow][toCol];
+    state->board[toRow][toCol] = state->board[fromRow][fromCol];
+    state->board[fromRow][fromCol] = EMPTY;
+
+    bool kingInCheck = isInCheck(state, state->isWhiteTurn);
+
+    // Undo the move
+    state->board[fromRow][fromCol] = state->board[toRow][toCol];
+    state->board[toRow][toCol] = tempPiece;
+
+    return kingInCheck;
 }
 
 char getYesNoResponse() {
@@ -1022,6 +1110,7 @@ bool handleCursorSelection(GameState* state) {
             printf("Invalid move. Try again.\n");
         }
     }
+    return false;
 }
 
 bool isStalemate(GameState* state) {
