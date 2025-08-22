@@ -8,8 +8,49 @@
 #include <termios.h>    // Linux terminal handling
 #include <sys/select.h> // For non-blocking input
 #include <limits.h>     // For INT_MIN
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
 
 #define BOARD_SIZE 8
+// Network constants
+#define MAX_FEN_LENGTH 256
+#define MAX_MESSAGE_LENGTH 512
+#define RELAY_SERVER_PORT 8080
+#define DEFAULT_RELAY_SERVER "104.131.161.240"  // Free DigitalOcean droplet (example)
+
+typedef enum {
+    MSG_JOIN_ROOM,
+    MSG_ROOM_JOINED,
+    MSG_ROOM_FULL,
+    MSG_PLAYER_CONNECTED,
+    MSG_GAME_STATE,
+    MSG_MOVE,
+    MSG_CHAT,
+    MSG_DISCONNECT,
+    MSG_ERROR
+} MessageType;
+
+typedef struct {
+    MessageType type;
+    char data[MAX_MESSAGE_LENGTH];
+    char roomCode[16];
+    bool isWhitePlayer;
+} NetworkMessage;
+
+typedef struct {
+    int socket;
+    bool isHost;
+    bool isWhitePlayer;
+    bool isConnected;
+    char roomCode[16];
+    char opponentIP[64];
+    int opponentPort;
+    pthread_t networkThread;
+} MultiplayerSession;
 
 // Piece representations
 #define EMPTY ' '
@@ -165,6 +206,22 @@ bool handleCursorSelection(GameState* state);
 int minimax(GameState* state, int depth, int alpha, int beta, bool isMaximizingPlayer);
 int quiescence(GameState* state, int alpha, int beta, bool isMaximizingPlayer);
 
+// FEN and networking function prototypes
+char* gameStateToFEN(GameState* state);
+bool fenToGameState(const char* fen, GameState* state);
+bool initializeMultiplayer(MultiplayerSession* session, const char* roomCode, bool isHost);
+bool connectToOpponent(MultiplayerSession* session);
+bool sendGameState(MultiplayerSession* session, GameState* state);
+bool receiveGameState(MultiplayerSession* session, GameState* state);
+bool sendMove(MultiplayerSession* session, int fromRow, int fromCol, int toRow, int toCol);
+bool receiveMove(MultiplayerSession* session, int* fromRow, int* fromCol, int* toRow, int* toCol);
+void* networkListener(void* arg);
+void cleanupMultiplayer(MultiplayerSession* session);
+bool createRoom(MultiplayerSession* session, const char* roomCode);
+bool joinRoom(MultiplayerSession* session, const char* roomCode);
+void generateRoomCode(char* roomCode);
+bool isValidRoomCode(const char* roomCode);
+
 // Piece values for evaluation
 #define PAWN_VALUE 100
 #define KNIGHT_VALUE 300
@@ -243,19 +300,31 @@ int main() {
     GameState state;
     bool playAgainstAI = false;
     bool playerIsWhite = true;
+    MultiplayerSession multiplayerSession;
+    bool isMultiplayer = false;
     
     printf("=== Chess Game for Ubuntu ===\n");
     printf("This chess game supports:\n");
-    printf("- Human vs Human mode\n");
+    printf("- Human vs Human mode (local)\n");
     printf("- Human vs AI mode with adjustable difficulty\n");
+    printf("- MULTIPLAYER mode (play with friends anywhere!)\n");
     printf("- Cursor-based piece movement (WASD + SPACE)\n");
     printf("- All standard chess rules including castling and en passant\n\n");
     
     srand(time(NULL)); // Initialize random seed for AI moves
     enableRawMode(); // Enable raw mode for immediate key capture
 
-    printf("Do you want to play against the AI? (y/n): ");
-    if (getYesNoResponse() == 'y') {
+    // Game mode selection
+    printf("Select game mode:\n");
+    printf("1. Local Human vs Human\n");
+    printf("2. Human vs AI\n");
+    printf("3. MULTIPLAYER (online)\n");
+    printf("Enter choice (1-3): ");
+    
+    char choice = getch();
+    printf("%c\n", choice);
+    
+    if (choice == '2') {
         playAgainstAI = true;
         printf("Do you want to play as White? (y/n): ");
         playerIsWhite = (getYesNoResponse() == 'y');
@@ -274,12 +343,106 @@ int main() {
         
         printf("AI depth set to %d. Starting game...\n", aiDepth);
         sleepMs(1000);
+    } else if (choice == '3') {
+        isMultiplayer = true;
+        disableRawMode(); // Disable for networking setup
+        
+        printf("\n=== MULTIPLAYER SETUP ===\n");
+        printf("1. Create a room (you'll be the host)\n");
+        printf("2. Join a room (enter room code)\n");
+        printf("Choose (1-2): ");
+        
+        char hostChoice;
+        scanf(" %c", &hostChoice);
+        
+        char roomCode[16];
+        bool isHost = (hostChoice == '1');
+        
+        if (isHost) {
+            generateRoomCode(roomCode);
+            printf("\nCreated room: %s\n", roomCode);
+            printf("Share this code with your opponent!\n");
+            printf("You will play as WHITE (first move).\n");
+            playerIsWhite = true;
+        } else {
+            printf("Enter room code: ");
+            scanf("%s", roomCode);
+            if (!isValidRoomCode(roomCode)) {
+                printf("Invalid room code format. Exiting.\n");
+                return 1;
+            }
+            printf("You will play as BLACK (second move).\n");
+            playerIsWhite = false;
+        }
+        
+        if (!initializeMultiplayer(&multiplayerSession, roomCode, isHost)) {
+            printf("Failed to initialize multiplayer session.\n");
+            return 1;
+        }
+        
+        printf("\nConnecting to opponent...\n");
+        if (!connectToOpponent(&multiplayerSession)) {
+            printf("Failed to connect to opponent.\n");
+            cleanupMultiplayer(&multiplayerSession);
+            return 1;
+        }
+        
+        printf("Connected! Starting multiplayer game...\n");
+        printf("Room: %s | You are: %s\n", roomCode, playerIsWhite ? "WHITE" : "BLACK");
+        printf("Connection established with opponent\n");
+        
+        // Initial sync
+        if (isHost) {
+            printf("Sending initial game state...\n");
+            sleepMs(1000);
+            if (!sendGameState(&multiplayerSession, &state)) {
+                printf("Failed to send initial game state!\n");
+                cleanupMultiplayer(&multiplayerSession);
+                return 1;
+            }
+            printf("Initial game state sent!\n");
+        } else {
+            printf("Waiting for initial game state...\n");
+            int attempts = 0;
+            bool received = false;
+            while (attempts < 100 && !received) {
+                if (receiveGameState(&multiplayerSession, &state)) {
+                    received = true;
+                    printf("Received initial game state!\n");
+                    break;
+                }
+                usleep(100000);
+                attempts++;
+                if (attempts % 10 == 0) {
+                    printf("Still waiting... (%d/10 seconds)\n", attempts/10);
+                }
+            }
+            if (!received) {
+                printf("Failed to receive initial game state!\n");
+                printf("Make sure the host has started the game first.\n");
+                cleanupMultiplayer(&multiplayerSession);
+                return 1;
+            }
+        }
+        
+        sleepMs(1000);
+        enableRawMode(); // Re-enable for game
+    } else {
+        printf("Local Human vs Human mode selected.\n");
+        sleepMs(1000);
     }
     
     initializeGameState(&state);
     
     while (true) {
         printBoardWithCursor(&state);
+        
+        if (isMultiplayer && multiplayerSession.isConnected) {
+            printf("MULTIPLAYER | Room: %s | You: %s | Opponent: %s\n", 
+                   multiplayerSession.roomCode, 
+                   multiplayerSession.isWhitePlayer ? "WHITE" : "BLACK",
+                   multiplayerSession.isWhitePlayer ? "BLACK" : "WHITE");
+        }
         
         if (isCheckmate(&state)) {
             printf("Checkmate! %s wins!\n", state.isWhiteTurn ? "Black" : "White");
@@ -306,8 +469,7 @@ int main() {
                 break;
             }
             
-            // Validate the AI move before making it
-            if (!isValidMove(&state, fromRow, fromCol, toRow, toCol)) {
+                if (!isValidMove(&state, fromRow, fromCol, toRow, toCol)) {
                 printf("ERROR: AI suggested illegal move %c%d to %c%d!\n", 
                        'a' + fromCol, BOARD_SIZE - fromRow, 'a' + toCol, BOARD_SIZE - toRow);
                 printf("Piece at source: '%c'\n", state.board[fromRow][fromCol]);
@@ -328,21 +490,111 @@ int main() {
             state.isWhiteTurn = !state.isWhiteTurn;
             printf("AI move executed: %c%d to %c%d\n", 'a' + fromCol, BOARD_SIZE - fromRow, 'a' + toCol, BOARD_SIZE - toRow);
             sleepMs(2000); // Give more time to see the move
+        } else if (isMultiplayer && state.isWhiteTurn != playerIsWhite) {
+            printf("Waiting for opponent's move... (Press 'r' to refresh, 'q' to quit)\n");
+            int fromRow, fromCol, toRow, toCol;
+            bool moveReceived = false;
+            int waitCount = 0;
+            
+            while (multiplayerSession.isConnected && !moveReceived) {
+                fd_set readfds;
+                FD_ZERO(&readfds);
+                FD_SET(STDIN_FILENO, &readfds);
+                struct timeval timeout = {0, 100000};
+                
+                if (select(1, &readfds, NULL, NULL, &timeout) > 0) {
+                    char input = getch();
+                    if (input == 'q' || input == EXIT_KEY) {
+                        printf("\nExiting multiplayer game...\n");
+                        return 0;
+                    } else if (input == 'r') {
+                        printf("Refreshing connection...\n");
+                    }
+                }
+                
+                if (receiveMove(&multiplayerSession, &fromRow, &fromCol, &toRow, &toCol)) {
+                    printf("Received move from opponent!\n");
+                    if (isValidMove(&state, fromRow, fromCol, toRow, toCol)) {
+                        makeMove(&state, fromRow, fromCol, toRow, toCol);
+                        state.isWhiteTurn = !state.isWhiteTurn;
+                        printf("Opponent moved: %c%d to %c%d\n", 
+                               'a' + fromCol, BOARD_SIZE - fromRow, 'a' + toCol, BOARD_SIZE - toRow);
+                        moveReceived = true;
+                    } else {
+                        printf("Received invalid move from opponent!\n");
+                        printf("   Move: %c%d to %c%d\n", 
+                               'a' + fromCol, BOARD_SIZE - fromRow, 'a' + toCol, BOARD_SIZE - toRow);
+                    }
+                }
+                
+                if (!moveReceived) {
+                    GameState receivedState = state;
+                    if (receiveGameState(&multiplayerSession, &receivedState)) {
+                        printf("Received game state from opponent!\n");
+                        if (receivedState.isWhiteTurn != state.isWhiteTurn || 
+                            receivedState.fullmoveNumber != state.fullmoveNumber) {
+                            state = receivedState;
+                            printf("Game state updated from opponent.\n");
+                            moveReceived = true;
+                        } else {
+                            printf("Same game state received, continuing to wait...\n");
+                        }
+                    }
+                }
+                
+                waitCount++;
+                if (waitCount % 20 == 0) {
+                    printf("Still waiting... (Connection: %s)\n", 
+                           multiplayerSession.isConnected ? "ACTIVE" : "LOST");
+                }
+                
+                if (!moveReceived) {
+                    usleep(100000);
+                }
+            }
+            
+            if (!multiplayerSession.isConnected) {
+                printf("Connection lost! Exiting multiplayer game.\n");
+                break;
+            }
         } else {
-            printf("%s's turn. Use WASD to move cursor, SPACE to select/move, '%c' to quit: ", 
-                   state.isWhiteTurn ? "White" : "Black", EXIT_KEY);
+                        if (isMultiplayer) {
+                printf("YOUR TURN (%s). Use WASD to move cursor, SPACE to select/move, '%c' to quit: ", 
+                       state.isWhiteTurn ? "White" : "Black", EXIT_KEY);
+            } else {
+                printf("%s's turn. Use WASD to move cursor, SPACE to select/move, '%c' to quit: ", 
+                       state.isWhiteTurn ? "White" : "Black", EXIT_KEY);
+            }
             char input = getch();
             if (input == EXIT_KEY) {
                 printf("\nExiting the game. Thanks for playing!\n");
                 break;
             } else if (input == ' ') {
-                if (!handleCursorSelection(&state)) {
-                    sleepMs(500); // Pause to show message
+                GameState prevState = state;
+                bool wasSelected = pieceSelected;
+                int prevSelectedRow = selectedRow;
+                int prevSelectedCol = selectedCol;
+                
+                if (handleCursorSelection(&state)) {
+                    if (isMultiplayer && wasSelected && !pieceSelected) {
+                        if (multiplayerSession.isConnected) {
+                            sendMove(&multiplayerSession, prevSelectedRow, prevSelectedCol, cursorRow, cursorCol);
+                            sendGameState(&multiplayerSession, &state);
+                            printf("Move sent to opponent!\n");
+                        }
+                    }
+                } else {
+                    sleepMs(500);
                 }
             } else {
                 moveCursor(input);
             }
         }
+    }
+    
+    // Cleanup multiplayer if used
+    if (isMultiplayer) {
+        cleanupMultiplayer(&multiplayerSession);
     }
     
     disableRawMode();
@@ -448,14 +700,11 @@ bool isValidMove(GameState* state, int fromRow, int fromCol, int toRow, int toCo
     
     char piece = state->board[fromRow][fromCol];
     
-    // Check if there's a piece to move
     if (piece == EMPTY) return false;
     
-    // Check if it's the correct player's turn
     if (state->isWhiteTurn && !isupper(piece)) return false;
     if (!state->isWhiteTurn && isupper(piece)) return false;
     
-    // Check if trying to capture own piece
     if (state->isWhiteTurn && isupper(state->board[toRow][toCol])) return false;
     if (!state->isWhiteTurn && islower(state->board[toRow][toCol])) return false;
     
@@ -486,13 +735,11 @@ bool isValidMove(GameState* state, int fromRow, int fromCol, int toRow, int toCo
     
     if (!validPieceMove) return false;
     
-    // Check if piece is pinned and move is not along pin ray
     PinInfo pinInfo = getPinInfo(state, fromRow, fromCol);
     if (pinInfo.isPinned && !isMoveAlongPinRay(fromRow, fromCol, toRow, toCol, pinInfo)) {
         return false;
     }
     
-    // FIXED: Check if move puts own king in check (this was the bug in original code)
     if (doesMovePutKingInCheck(state, fromRow, fromCol, toRow, toCol)) {
         return false;
     }
@@ -1055,7 +1302,6 @@ int evaluateBoard(GameState* state) {
     return score;
 }
 
-// COMPLETED: Previously empty function
 int evaluatePawnStructure(GameState* state) {
     int score = 0;
     
@@ -1092,7 +1338,6 @@ int evaluatePawnStructure(GameState* state) {
     return score;
 }
 
-// COMPLETED: Previously empty function
 int evaluateKingSafety(GameState* state) {
     int score = 0;
     int whiteKingRow = -1, whiteKingCol = -1;
@@ -1138,7 +1383,6 @@ int evaluateKingSafety(GameState* state) {
         }
     }
     
-    // IMPROVED: Add immediate threat detection
     if (isInCheck(state, true)) {
         score -= 500; // Heavy penalty for being in check
     }
@@ -1166,7 +1410,6 @@ int evaluateKingSafety(GameState* state) {
     return score;
 }
 
-// NEW: Threat evaluation function to prevent tactical blunders
 int evaluateThreats(GameState* state) {
     int score = 0;
     
@@ -1285,7 +1528,6 @@ int evaluateThreats(GameState* state) {
     return score;
 }
 
-// NEW: Simple opening book to prevent obvious blunders
 int getOpeningBookMove(GameState* state) {
     printf("Checking opening book... Move %d, Turn: %s\n", 
            state->fullmoveNumber, state->isWhiteTurn ? "White" : "Black");
@@ -1508,7 +1750,6 @@ int moveValue(GameState* state, int move[4]) {
     
     int value = 0;
     
-    // CRITICAL: Check if king is in check - prioritize defensive moves
     bool isWhitePiece = isupper(piece);
     if (isInCheck(state, isWhitePiece)) {
         // If king is in check, prioritize moves that get out of check
@@ -1592,7 +1833,6 @@ void getAIMove(GameState* state, int *fromRow, int *fromCol, int *toRow, int *to
     printf("AI thinking... Turn: %s, Move: %d\n", 
            state->isWhiteTurn ? "White" : "Black", state->fullmoveNumber);
     
-    // IMPROVED: Check for opening book moves first
     if (state->fullmoveNumber <= 4) { // Only in early opening
         int bookMove = getOpeningBookMove(state);
         if (bookMove != -1) {
@@ -1757,9 +1997,12 @@ void printBoardWithCursor(GameState* state) {
     clearScreen();
     
     printf("\n=== Chess Game ===\n");
-    printf("Turn: %s | Cursor: %c%d | Controls: WASD + SPACE\n\n", 
+    printf("Turn: %s | Cursor: %c%d | Controls: WASD + SPACE\n", 
            state->isWhiteTurn ? "White" : "Black", 
            'a' + cursorCol, BOARD_SIZE - cursorRow);
+    
+    // Multiplayer status will be shown by caller if needed
+    printf("\n");
     
     printf("   +---+---+---+---+---+---+---+---+\n");
     for (int i = 0; i < BOARD_SIZE; i++) {
@@ -2117,7 +2360,6 @@ int scoreMoveForOrdering(GameState* state, int move[4]) {
         score += victimValue - attackerValue / 10;
     }
     
-    // CRITICAL: Scholar's Mate defense has highest priority
     char piece = state->board[fromRow][fromCol];
     if (piece == BLACK_KNIGHT && toRow == 3 && toCol == 7) {
         // Nxh5 - capturing queen in Scholar's Mate
@@ -2268,4 +2510,427 @@ int evaluateScholarsMateDefense(GameState* state) {
     }
     
     return score;
+}
+
+// Convert GameState to FEN (Forsyth-Edwards Notation)
+char* gameStateToFEN(GameState* state) {
+    static char fen[MAX_FEN_LENGTH];
+    char* fenPtr = fen;
+    
+    // 1. Piece placement (from rank 8 to rank 1)
+    for (int rank = 0; rank < BOARD_SIZE; rank++) {
+        int emptyCount = 0;
+        
+        for (int file = 0; file < BOARD_SIZE; file++) {
+            char piece = state->board[rank][file];
+            
+            if (piece == EMPTY) {
+                emptyCount++;
+            } else {
+                if (emptyCount > 0) {
+                    *fenPtr++ = '0' + emptyCount;
+                    emptyCount = 0;
+                }
+                *fenPtr++ = piece;
+            }
+        }
+        
+        if (emptyCount > 0) {
+            *fenPtr++ = '0' + emptyCount;
+        }
+        
+        if (rank < BOARD_SIZE - 1) {
+            *fenPtr++ = '/';
+        }
+    }
+    
+    // 2. Active color
+    *fenPtr++ = ' ';
+    *fenPtr++ = state->isWhiteTurn ? 'w' : 'b';
+    
+    // 3. Castling availability
+    *fenPtr++ = ' ';
+    bool hasCastling = false;
+    if (state->canWhiteCastleKingside) { *fenPtr++ = 'K'; hasCastling = true; }
+    if (state->canWhiteCastleQueenside) { *fenPtr++ = 'Q'; hasCastling = true; }
+    if (state->canBlackCastleKingside) { *fenPtr++ = 'k'; hasCastling = true; }
+    if (state->canBlackCastleQueenside) { *fenPtr++ = 'q'; hasCastling = true; }
+    if (!hasCastling) { *fenPtr++ = '-'; }
+    
+    // 4. En passant target square
+    *fenPtr++ = ' ';
+    if (state->enPassantTargetRow != -1 && state->enPassantTargetCol != -1) {
+        *fenPtr++ = 'a' + state->enPassantTargetCol;
+        *fenPtr++ = '8' - state->enPassantTargetRow;
+    } else {
+        *fenPtr++ = '-';
+    }
+    
+    // 5. Halfmove clock
+    *fenPtr++ = ' ';
+    sprintf(fenPtr, "%d", state->halfmoveClock);
+    fenPtr += strlen(fenPtr);
+    
+    // 6. Fullmove number
+    *fenPtr++ = ' ';
+    sprintf(fenPtr, "%d", state->fullmoveNumber);
+    fenPtr += strlen(fenPtr);
+    
+    *fenPtr = '\0';
+    
+    printf("Generated FEN: %s\n", fen);
+    return fen;
+}
+
+// Convert FEN string to GameState
+bool fenToGameState(const char* fen, GameState* state) {
+    printf("Parsing FEN: %s\n", fen);
+    
+    // Initialize state
+    memset(state, 0, sizeof(GameState));
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            state->board[i][j] = EMPTY;
+        }
+    }
+    
+    const char* ptr = fen;
+    
+    // 1. Parse piece placement
+    int rank = 0, file = 0;
+    while (*ptr && *ptr != ' ') {
+        if (*ptr == '/') {
+            rank++;
+            file = 0;
+        } else if (isdigit(*ptr)) {
+            file += (*ptr - '0');
+        } else {
+            if (rank < BOARD_SIZE && file < BOARD_SIZE) {
+                state->board[rank][file] = *ptr;
+                file++;
+            }
+        }
+        ptr++;
+    }
+    
+    if (*ptr == ' ') ptr++;
+    
+    // 2. Parse active color
+    state->isWhiteTurn = (*ptr == 'w');
+    ptr++;
+    if (*ptr == ' ') ptr++;
+    
+    // 3. Parse castling rights
+    state->canWhiteCastleKingside = false;
+    state->canWhiteCastleQueenside = false;
+    state->canBlackCastleKingside = false;
+    state->canBlackCastleQueenside = false;
+    
+    while (*ptr && *ptr != ' ') {
+        switch (*ptr) {
+            case 'K': state->canWhiteCastleKingside = true; break;
+            case 'Q': state->canWhiteCastleQueenside = true; break;
+            case 'k': state->canBlackCastleKingside = true; break;
+            case 'q': state->canBlackCastleQueenside = true; break;
+        }
+        ptr++;
+    }
+    
+    // Copy castling rights to duplicate fields (for compatibility)
+    state->whiteCastleKingside = state->canWhiteCastleKingside;
+    state->whiteCastleQueenside = state->canWhiteCastleQueenside;
+    state->blackCastleKingside = state->canBlackCastleKingside;
+    state->blackCastleQueenside = state->canBlackCastleQueenside;
+    
+    if (*ptr == ' ') ptr++;
+    
+    // 4. Parse en passant target
+    state->enPassantTargetRow = -1;
+    state->enPassantTargetCol = -1;
+    if (*ptr != '-') {
+        if (*ptr >= 'a' && *ptr <= 'h') {
+            state->enPassantTargetCol = *ptr - 'a';
+            ptr++;
+            if (*ptr >= '1' && *ptr <= '8') {
+                state->enPassantTargetRow = '8' - *ptr;
+                ptr++;
+            }
+        }
+    } else {
+        ptr++;
+    }
+    
+    if (*ptr == ' ') ptr++;
+    
+    // 5. Parse halfmove clock
+    state->halfmoveClock = 0;
+    while (*ptr && isdigit(*ptr)) {
+        state->halfmoveClock = state->halfmoveClock * 10 + (*ptr - '0');
+        ptr++;
+    }
+    
+    if (*ptr == ' ') ptr++;
+    
+    // 6. Parse fullmove number
+    state->fullmoveNumber = 1;
+    while (*ptr && isdigit(*ptr)) {
+        state->fullmoveNumber = state->fullmoveNumber * 10 + (*ptr - '0');
+        ptr++;
+    }
+    
+    printf("FEN parsed successfully. Turn: %s, Move: %d\n", 
+           state->isWhiteTurn ? "White" : "Black", state->fullmoveNumber);
+    
+    return true;
+}
+
+// Generate a random 6-character room code
+void generateRoomCode(char* roomCode) {
+    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (int i = 0; i < 6; i++) {
+        roomCode[i] = charset[rand() % (sizeof(charset) - 1)];
+    }
+    roomCode[6] = '\0';
+}
+
+// Validate room code format
+bool isValidRoomCode(const char* roomCode) {
+    if (strlen(roomCode) != 6) return false;
+    for (int i = 0; i < 6; i++) {
+        if (!isalnum(roomCode[i])) return false;
+    }
+    return true;
+}
+
+// Initialize multiplayer session
+bool initializeMultiplayer(MultiplayerSession* session, const char* roomCode, bool isHost) {
+    memset(session, 0, sizeof(MultiplayerSession));
+    strncpy(session->roomCode, roomCode, sizeof(session->roomCode) - 1);
+    session->isHost = isHost;
+    session->isWhitePlayer = isHost; // Host plays as white by default
+    session->isConnected = false;
+    session->socket = -1;
+    
+    printf("Initializing multiplayer session. Room: %s, Host: %s\n", 
+           roomCode, isHost ? "Yes" : "No");
+    
+    return true;
+}
+
+// Simple peer-to-peer connection (simplified for demonstration)
+bool connectToOpponent(MultiplayerSession* session) {
+    printf("Connecting to opponent in room %s...\n", session->roomCode);
+    
+    // Create socket
+    session->socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (session->socket < 0) {
+        printf("Failed to create socket: %s\n", strerror(errno));
+        return false;
+    }
+    
+    if (session->isHost) {
+        // Host: Listen for connections
+        struct sockaddr_in serverAddr, clientAddr;
+        socklen_t clientLen = sizeof(clientAddr);
+        
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = htons(9000 + (session->roomCode[0] % 1000)); // Simple port mapping
+        
+        if (bind(session->socket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+            printf("Bind failed: %s\n", strerror(errno));
+            close(session->socket);
+            return false;
+        }
+        
+        if (listen(session->socket, 1) < 0) {
+            printf("Listen failed: %s\n", strerror(errno));
+            close(session->socket);
+            return false;
+        }
+        
+        printf("Waiting for opponent to join room %s...\n", session->roomCode);
+        printf("Room info - Port: %d\n", 9000 + (session->roomCode[0] % 1000));
+        printf("Share this room code with your opponent: %s\n", session->roomCode);
+        
+        int clientSocket = accept(session->socket, (struct sockaddr*)&clientAddr, &clientLen);
+        if (clientSocket < 0) {
+            printf("Accept failed: %s\n", strerror(errno));
+            close(session->socket);
+            return false;
+        }
+        
+        close(session->socket);
+        session->socket = clientSocket;
+        session->isConnected = true;
+        
+        // Get opponent IP for display
+        inet_ntop(AF_INET, &clientAddr.sin_addr, session->opponentIP, sizeof(session->opponentIP));
+        
+        printf("Opponent connected from %s\n", session->opponentIP);
+        
+    } else {
+        // Client: Connect to host
+        printf("Enter the host's IP address (or press Enter for localhost): ");
+        char hostIP[64];
+        fgets(hostIP, sizeof(hostIP), stdin);
+        hostIP[strcspn(hostIP, "\n")] = 0; // Remove newline
+        
+        if (strlen(hostIP) == 0) {
+            strcpy(hostIP, "127.0.0.1"); // Default to localhost
+        }
+        
+        struct sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(9000 + (session->roomCode[0] % 1000));
+        inet_pton(AF_INET, hostIP, &serverAddr.sin_addr);
+        
+        printf("Connecting to %s:%d...\n", hostIP, 9000 + (session->roomCode[0] % 1000));
+        
+        if (connect(session->socket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+            printf("Connection failed: %s\n", strerror(errno));
+            printf("Make sure the host has created the room and provided their IP address.\n");
+            close(session->socket);
+            return false;
+        }
+        
+        session->isConnected = true;
+        strcpy(session->opponentIP, hostIP);
+        
+        printf("Connected to host at %s\n", hostIP);
+    }
+    
+    // Set socket to non-blocking for non-blocking reads
+    int flags = fcntl(session->socket, F_GETFL, 0);
+    fcntl(session->socket, F_SETFL, flags | O_NONBLOCK);
+    
+    return true;
+}
+
+// Send game state as FEN
+bool sendGameState(MultiplayerSession* session, GameState* state) {
+    if (!session->isConnected) {
+        printf("Cannot send game state - not connected!\n");
+        return false;
+    }
+    
+    char* fen = gameStateToFEN(state);
+    NetworkMessage msg;
+    msg.type = MSG_GAME_STATE;
+    strncpy(msg.data, fen, sizeof(msg.data) - 1);
+    msg.data[sizeof(msg.data) - 1] = '\0';
+    msg.isWhitePlayer = session->isWhitePlayer;
+    
+    printf("Sending game state...\n");
+    
+    ssize_t sent = send(session->socket, &msg, sizeof(msg), 0);
+    if (sent < 0) {
+        printf("Failed to send game state: %s\n", strerror(errno));
+        return false;
+    }
+    
+    printf("Game state sent!\n");
+    return true;
+}
+
+// Receive game state as FEN
+bool receiveGameState(MultiplayerSession* session, GameState* state) {
+    if (!session->isConnected) return false;
+    
+    NetworkMessage msg;
+    ssize_t received = recv(session->socket, &msg, sizeof(msg), MSG_DONTWAIT);
+    
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return false; // No data available
+        }
+        printf("Failed to receive game state: %s\n", strerror(errno));
+        session->isConnected = false;
+        return false;
+    }
+    
+    if (received == 0) {
+        printf("Opponent disconnected.\n");
+        session->isConnected = false;
+        return false;
+    }
+    
+    if (msg.type == MSG_GAME_STATE) {
+        if (fenToGameState(msg.data, state)) {
+            printf("Received game state from opponent.\n");
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// Send a move to opponent
+bool sendMove(MultiplayerSession* session, int fromRow, int fromCol, int toRow, int toCol) {
+    if (!session->isConnected) {
+        printf("Cannot send move - not connected!\n");
+        return false;
+    }
+    
+    NetworkMessage msg;
+    msg.type = MSG_MOVE;
+    snprintf(msg.data, sizeof(msg.data), "%d,%d,%d,%d", fromRow, fromCol, toRow, toCol);
+    msg.isWhitePlayer = session->isWhitePlayer;
+    
+    printf("Sending move: %c%d to %c%d\n", 
+           'a' + fromCol, BOARD_SIZE - fromRow,
+           'a' + toCol, BOARD_SIZE - toRow);
+    
+    ssize_t sent = send(session->socket, &msg, sizeof(msg), 0);
+    if (sent < 0) {
+        printf("Failed to send move: %s\n", strerror(errno));
+        return false;
+    }
+    
+    printf("Move sent!\n");
+    return true;
+}
+
+// Receive a move from opponent
+bool receiveMove(MultiplayerSession* session, int* fromRow, int* fromCol, int* toRow, int* toCol) {
+    if (!session->isConnected) return false;
+    
+    NetworkMessage msg;
+    ssize_t received = recv(session->socket, &msg, sizeof(msg), MSG_DONTWAIT);
+    
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return false; // No data available
+        }
+        printf("Failed to receive move: %s\n", strerror(errno));
+        session->isConnected = false;
+        return false;
+    }
+    
+    if (received == 0) {
+        printf("Opponent disconnected.\n");
+        session->isConnected = false;
+        return false;
+    }
+    
+    if (msg.type == MSG_MOVE) {
+        if (sscanf(msg.data, "%d,%d,%d,%d", fromRow, fromCol, toRow, toCol) == 4) {
+            printf("Received move: %c%d to %c%d\n", 
+                   'a' + *fromCol, BOARD_SIZE - *fromRow,
+                   'a' + *toCol, BOARD_SIZE - *toRow);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// Cleanup multiplayer resources
+void cleanupMultiplayer(MultiplayerSession* session) {
+    if (session->socket >= 0) {
+        close(session->socket);
+        session->socket = -1;
+    }
+    session->isConnected = false;
+    printf("Multiplayer session cleaned up.\n");
 }
