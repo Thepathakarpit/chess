@@ -6,6 +6,9 @@
 #include <time.h>
 #include <conio.h> 
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <process.h>
 
 #define BOARD_SIZE 8
 
@@ -24,7 +27,19 @@
 #define BLACK_QUEEN 'q'
 #define BLACK_KING 'k'
 
+#define QUEEN_VALUE 900
+#define ROOK_VALUE 500
+#define BISHOP_VALUE 300
+#define KNIGHT_VALUE 300
+#define PAWN_VALUE 100
+
 #define EXIT_KEY 'q'
+
+// Network constants
+#define MAX_FEN_LENGTH 256
+#define MAX_MESSAGE_LENGTH 512
+#define RELAY_SERVER_PORT 8080
+#define DEFAULT_RELAY_SERVER "104.131.161.240"
 
 typedef struct {
     bool whiteCastleKingside;
@@ -42,6 +57,28 @@ typedef struct {
     bool canBlackCastleKingside;
     bool canBlackCastleQueenside;
 } GameState;
+
+typedef enum {
+    MSG_JOIN_ROOM,
+    MSG_LEAVE_ROOM,
+    MSG_MOVE,
+    MSG_GAME_STATE,
+    MSG_PING
+} MessageType;
+
+typedef struct {
+    MessageType type;
+    char data[MAX_MESSAGE_LENGTH];
+} NetworkMessage;
+
+typedef struct {
+    SOCKET socket;
+    bool isHost;
+    bool isConnected;
+    char roomCode[7];
+    char opponentIP[16];
+    int port;
+} MultiplayerSession;
 
 // Function prototypes
 void initializeGameState(GameState* state);
@@ -78,6 +115,19 @@ int evaluateBoard(GameState* state);
 int evaluatePawnStructure(GameState* state);
 int evaluateKingSafety(GameState* state);
 bool isPieceUnderAttack(GameState* state, int row, int col);
+
+// FEN and networking function prototypes
+char* gameStateToFEN(GameState* state);
+bool fenToGameState(const char* fen, GameState* state);
+bool initializeMultiplayer(MultiplayerSession* session);
+bool connectToOpponent(MultiplayerSession* session);
+bool sendGameState(MultiplayerSession* session, GameState* state);
+bool receiveGameState(MultiplayerSession* session, GameState* state);
+bool sendMove(MultiplayerSession* session, int fromRow, int fromCol, int toRow, int toCol);
+bool receiveMove(MultiplayerSession* session, int* fromRow, int* fromCol, int* toRow, int* toCol);
+void generateRoomCode(char* roomCode);
+bool isValidRoomCode(const char* roomCode);
+void cleanupMultiplayer(MultiplayerSession* session);
 // Add these global variables at the top of the file
 int cursorRow = 0;
 int cursorCol = 0;
@@ -88,7 +138,7 @@ int selectedCol = -1;
 // Add these function prototypes
 void moveCursor(char direction);
 void printBoardWithCursor(GameState* state);
-bool handleCursorSelection(GameState* state);
+bool handleCursorSelection(GameState* state, MultiplayerSession* multiplayer, int choice);
 
 // Increase the search depth for a stronger AI
 #define MAX_DEPTH 5
@@ -100,17 +150,25 @@ int main() {
     GameState state;
     bool playAgainstAI = false;
     bool playerIsWhite = true;
+    MultiplayerSession multiplayer;
     
     srand(time(NULL)); // Initialize random seed for AI moves
 
-    printf("Do you want to play against the AI? (y/n): ");
-    if (getYesNoResponse() == 'y') {
+    printf("Choose game mode:\n");
+    printf("1. Local game\n");
+    printf("2. AI game\n");
+    printf("3. Multiplayer game\n");
+    printf("Enter choice (1-3): ");
+    
+    int choice;
+    scanf("%d", &choice);
+    
+    if (choice == 2) {
         playAgainstAI = true;
         printf("Do you want to play as White? (y/n): ");
         playerIsWhite = (getYesNoResponse() == 'y');
         printf("You will play as %s against the AI.\n", playerIsWhite ? "White" : "Black");
         
-        // Prompt for AI depth
         do {
             printf("Enter the AI depth (1-10, higher depth means longer thinking time): ");
             scanf("%d", &aiDepth);
@@ -118,6 +176,77 @@ int main() {
                 printf("Invalid depth. Please enter a number between 1 and 10.\n");
             }
         } while (aiDepth < 1 || aiDepth > 10);
+    } else if (choice == 3) {
+        if (!initializeMultiplayer(&multiplayer)) {
+            printf("Failed to initialize multiplayer\n");
+            return 1;
+        }
+        
+        printf("1. Create room\n");
+        printf("2. Join room\n");
+        printf("Enter choice (1-2): ");
+        int roomChoice;
+        scanf("%d", &roomChoice);
+        
+        if (roomChoice == 1) {
+            multiplayer.isHost = true;
+            generateRoomCode(multiplayer.roomCode);
+            printf("Room code: %s\n", multiplayer.roomCode);
+            printf("Share this code with your opponent\n");
+            
+            if (!connectToOpponent(&multiplayer)) {
+                printf("Failed to connect\n");
+                cleanupMultiplayer(&multiplayer);
+                return 1;
+            }
+            
+            playerIsWhite = true;
+            printf("You are White (host)\n");
+        } else {
+            multiplayer.isHost = false;
+            printf("Enter room code: ");
+            scanf("%s", multiplayer.roomCode);
+            
+            if (!isValidRoomCode(multiplayer.roomCode)) {
+                printf("Invalid room code\n");
+                cleanupMultiplayer(&multiplayer);
+                return 1;
+            }
+            
+            if (!connectToOpponent(&multiplayer)) {
+                printf("Failed to connect\n");
+                cleanupMultiplayer(&multiplayer);
+                return 1;
+            }
+            
+            playerIsWhite = false;
+            printf("You are Black (client)\n");
+        }
+        
+        printf("Waiting for initial game state...\n");
+        if (multiplayer.isHost) {
+            if (!sendGameState(&multiplayer, &state)) {
+                printf("Failed to send initial state\n");
+                cleanupMultiplayer(&multiplayer);
+                return 1;
+            }
+            printf("Sent initial game state\n");
+        } else {
+            int attempts = 0;
+            while (!receiveGameState(&multiplayer, &state) && attempts < 50) {
+                Sleep(100);
+                attempts++;
+                if (attempts % 10 == 0) {
+                    printf("Still waiting... (%d/50)\n", attempts);
+                }
+            }
+            if (attempts >= 50) {
+                printf("Failed to receive initial state\n");
+                cleanupMultiplayer(&multiplayer);
+                return 1;
+            }
+            printf("Received initial game state\n");
+        }
     }
     
     initializeGameState(&state);
@@ -132,7 +261,33 @@ int main() {
             printf("%s is in check!\n", state.isWhiteTurn ? "White" : "Black");
         }
 
-        if (playAgainstAI && state.isWhiteTurn != playerIsWhite) {
+        if (choice == 3 && state.isWhiteTurn != playerIsWhite) {
+            printf("Waiting for opponent's move...\n");
+            int fromRow, fromCol, toRow, toCol;
+            int attempts = 0;
+            bool moveReceived = false;
+            
+            while (!moveReceived && attempts < 100) {
+                if (receiveMove(&multiplayer, &fromRow, &fromCol, &toRow, &toCol)) {
+                    moveReceived = true;
+                    printf("Opponent moved: %c%d to %c%d\n", 'a' + fromCol, BOARD_SIZE - fromRow, 'a' + toCol, BOARD_SIZE - toRow);
+                } else if (receiveGameState(&multiplayer, &state)) {
+                    moveReceived = true;
+                    printf("Received updated game state from opponent\n");
+                } else {
+                    Sleep(100);
+                    attempts++;
+                    if (attempts % 20 == 0) {
+                        printf("Still waiting... (%d/100)\n", attempts);
+                    }
+                }
+            }
+            
+            if (!moveReceived) {
+                printf("Failed to receive opponent's move\n");
+                break;
+            }
+        } else if (playAgainstAI && state.isWhiteTurn != playerIsWhite) {
             int fromRow, fromCol, toRow, toCol;
             getAIMove(&state, &fromRow, &fromCol, &toRow, &toCol);
             if (fromRow == -1 || fromCol == -1 || toRow == -1 || toCol == -1) {
@@ -149,13 +304,17 @@ int main() {
                 printf("\nExiting the game. Thanks for playing!\n");
                 break;
             } else if (input == ' ') {
-                if (!handleCursorSelection(&state)) {
+                if (!handleCursorSelection(&state, &multiplayer, choice)) {
                     Sleep(1000); // Pause for a second to show the message
                 }
             } else {
                 moveCursor(input);
             }
         }
+    }
+    
+    if (choice == 3) {
+        cleanupMultiplayer(&multiplayer);
     }
     
     return 0;
@@ -1087,7 +1246,7 @@ void printBoardWithCursor(GameState* state) {
     printf("     a   b   c   d   e   f   g   h\n\n");
 }
 
-bool handleCursorSelection(GameState* state) {
+bool handleCursorSelection(GameState* state, MultiplayerSession* multiplayer, int choice) {
     if (!pieceSelected) {
         char piece = state->board[cursorRow][cursorCol];
         if ((state->isWhiteTurn && isupper(piece)) || (!state->isWhiteTurn && islower(piece))) {
@@ -1102,6 +1261,17 @@ bool handleCursorSelection(GameState* state) {
             pieceSelected = false;
             selectedRow = -1;
             selectedCol = -1;
+            
+            if (choice == 3) {
+                if (!sendMove(multiplayer, selectedRow, selectedCol, cursorRow, cursorCol)) {
+                    printf("Failed to send move to opponent\n");
+                } else {
+                    printf("Move sent to opponent\n");
+                }
+                if (!sendGameState(multiplayer, state)) {
+                    printf("Failed to send game state to opponent\n");
+                }
+            }
         } else if (cursorRow == selectedRow && cursorCol == selectedCol) {
             pieceSelected = false;
             selectedRow = -1;
@@ -1152,6 +1322,116 @@ bool isInsufficientMaterial(GameState* state) {
     return (whitePieces <= 1 && blackPieces <= 1);
 }
 
+char* gameStateToFEN(GameState* state) {
+    static char fen[MAX_FEN_LENGTH];
+    int fenIndex = 0;
+    
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        int emptyCount = 0;
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            char piece = state->board[i][j];
+            if (piece == EMPTY) {
+                emptyCount++;
+            } else {
+                if (emptyCount > 0) {
+                    fen[fenIndex++] = '0' + emptyCount;
+                    emptyCount = 0;
+                }
+                fen[fenIndex++] = piece;
+            }
+        }
+        if (emptyCount > 0) {
+            fen[fenIndex++] = '0' + emptyCount;
+        }
+        if (i < BOARD_SIZE - 1) {
+            fen[fenIndex++] = '/';
+        }
+    }
+    
+    fen[fenIndex++] = ' ';
+    fen[fenIndex++] = state->isWhiteTurn ? 'w' : 'b';
+    fen[fenIndex++] = ' ';
+    
+    if (state->canWhiteCastleKingside) fen[fenIndex++] = 'K';
+    if (state->canWhiteCastleQueenside) fen[fenIndex++] = 'Q';
+    if (state->canBlackCastleKingside) fen[fenIndex++] = 'k';
+    if (state->canBlackCastleQueenside) fen[fenIndex++] = 'q';
+    if (!state->canWhiteCastleKingside && !state->canWhiteCastleQueenside && 
+        !state->canBlackCastleKingside && !state->canBlackCastleQueenside) {
+        fen[fenIndex++] = '-';
+    }
+    
+    fen[fenIndex++] = ' ';
+    
+    if (state->enPassantTargetRow != -1) {
+        fen[fenIndex++] = 'a' + state->enPassantTargetCol;
+        fen[fenIndex++] = '0' + (BOARD_SIZE - state->enPassantTargetRow);
+    } else {
+        fen[fenIndex++] = '-';
+    }
+    
+    fen[fenIndex++] = ' ';
+    sprintf(&fen[fenIndex], "%d %d", state->halfmoveClock, state->fullmoveNumber);
+    
+    return fen;
+}
+
+bool fenToGameState(const char* fen, GameState* state) {
+    if (!fen || !state) return false;
+    
+    int fenIndex = 0;
+    int boardIndex = 0;
+    
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        for (int j = 0; j < BOARD_SIZE; j++) {
+            char c = fen[fenIndex];
+            if (c >= '1' && c <= '8') {
+                int emptyCount = c - '0';
+                for (int k = 0; k < emptyCount; k++) {
+                    state->board[i][j + k] = EMPTY;
+                }
+                j += emptyCount - 1;
+            } else if (c == '/') {
+                i++;
+                j = -1;
+            } else {
+                state->board[i][j] = c;
+            }
+            fenIndex++;
+        }
+    }
+    
+    while (fen[fenIndex] == ' ') fenIndex++;
+    state->isWhiteTurn = (fen[fenIndex] == 'w');
+    fenIndex += 2;
+    
+    while (fen[fenIndex] == ' ') fenIndex++;
+    state->canWhiteCastleKingside = (strchr(fen + fenIndex, 'K') != NULL);
+    state->canWhiteCastleQueenside = (strchr(fen + fenIndex, 'Q') != NULL);
+    state->canBlackCastleKingside = (strchr(fen + fenIndex, 'k') != NULL);
+    state->canBlackCastleQueenside = (strchr(fen + fenIndex, 'q') != NULL);
+    
+    while (fen[fenIndex] != ' ') fenIndex++;
+    fenIndex++;
+    
+    while (fen[fenIndex] == ' ') fenIndex++;
+    if (fen[fenIndex] == '-') {
+        state->enPassantTargetRow = -1;
+        state->enPassantTargetCol = -1;
+        fenIndex++;
+    } else {
+        state->enPassantTargetCol = fen[fenIndex] - 'a';
+        fenIndex++;
+        state->enPassantTargetRow = BOARD_SIZE - (fen[fenIndex] - '0');
+        fenIndex++;
+    }
+    
+    while (fen[fenIndex] == ' ') fenIndex++;
+    sscanf(fen + fenIndex, "%d %d", &state->halfmoveClock, &state->fullmoveNumber);
+    
+    return true;
+}
+
 bool isThreefoldRepetition(GameState* state) {
     // Implementation of threefold repetition rule is beyond the scope of this implementation
     return false;
@@ -1163,4 +1443,160 @@ bool isFiftyMoveRule(GameState* state) {
 
 bool isDraw(GameState* state) {
     return isStalemate(state) || isInsufficientMaterial(state) || isFiftyMoveRule(state);
+}
+
+bool initializeMultiplayer(MultiplayerSession* session) {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        printf("WSAStartup failed\n");
+        return false;
+    }
+    
+    session->socket = INVALID_SOCKET;
+    session->isHost = false;
+    session->isConnected = false;
+    session->port = 8080;
+    memset(session->roomCode, 0, sizeof(session->roomCode));
+    memset(session->opponentIP, 0, sizeof(session->opponentIP));
+    
+    return true;
+}
+
+bool connectToOpponent(MultiplayerSession* session) {
+    if (session->isHost) {
+        SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listenSocket == INVALID_SOCKET) {
+            printf("Failed to create listen socket\n");
+            return false;
+        }
+        
+        struct sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = htons(session->port);
+        
+        if (bind(listenSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            printf("Bind failed\n");
+            closesocket(listenSocket);
+            return false;
+        }
+        
+        if (listen(listenSocket, 1) == SOCKET_ERROR) {
+            printf("Listen failed\n");
+            closesocket(listenSocket);
+            return false;
+        }
+        
+        printf("Waiting for opponent to join room %s...\n", session->roomCode);
+        session->socket = accept(listenSocket, NULL, NULL);
+        closesocket(listenSocket);
+        
+        if (session->socket == INVALID_SOCKET) {
+            printf("Accept failed\n");
+            return false;
+        }
+        
+        session->isConnected = true;
+        printf("Opponent connected!\n");
+        return true;
+    } else {
+        printf("Enter host IP address: ");
+        scanf("%s", session->opponentIP);
+        
+        session->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (session->socket == INVALID_SOCKET) {
+            printf("Failed to create socket\n");
+            return false;
+        }
+        
+        struct sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(session->port);
+        inet_pton(AF_INET, session->opponentIP, &serverAddr.sin_addr);
+        
+        if (connect(session->socket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            printf("Connect failed\n");
+            closesocket(session->socket);
+            return false;
+        }
+        
+        session->isConnected = true;
+        printf("Connected to host!\n");
+        return true;
+    }
+}
+
+bool sendGameState(MultiplayerSession* session, GameState* state) {
+    if (!session->isConnected) return false;
+    
+    char* fen = gameStateToFEN(state);
+    NetworkMessage msg;
+    msg.type = MSG_GAME_STATE;
+    strcpy(msg.data, fen);
+    
+    int result = send(session->socket, (char*)&msg, sizeof(msg), 0);
+    return result != SOCKET_ERROR;
+}
+
+bool receiveGameState(MultiplayerSession* session, GameState* state) {
+    if (!session->isConnected) return false;
+    
+    NetworkMessage msg;
+    int result = recv(session->socket, (char*)&msg, sizeof(msg), 0);
+    if (result == SOCKET_ERROR) return false;
+    
+    if (msg.type == MSG_GAME_STATE) {
+        return fenToGameState(msg.data, state);
+    }
+    return false;
+}
+
+bool sendMove(MultiplayerSession* session, int fromRow, int fromCol, int toRow, int toCol) {
+    if (!session->isConnected) return false;
+    
+    NetworkMessage msg;
+    msg.type = MSG_MOVE;
+    sprintf(msg.data, "%d,%d,%d,%d", fromRow, fromCol, toRow, toCol);
+    
+    int result = send(session->socket, (char*)&msg, sizeof(msg), 0);
+    return result != SOCKET_ERROR;
+}
+
+bool receiveMove(MultiplayerSession* session, int* fromRow, int* fromCol, int* toRow, int* toCol) {
+    if (!session->isConnected) return false;
+    
+    NetworkMessage msg;
+    int result = recv(session->socket, (char*)&msg, sizeof(msg), 0);
+    if (result == SOCKET_ERROR) return false;
+    
+    if (msg.type == MSG_MOVE) {
+        sscanf(msg.data, "%d,%d,%d,%d", fromRow, fromCol, toRow, toCol);
+        return true;
+    }
+    return false;
+}
+
+void generateRoomCode(char* roomCode) {
+    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (int i = 0; i < 6; i++) {
+        roomCode[i] = charset[rand() % (sizeof(charset) - 1)];
+    }
+    roomCode[6] = '\0';
+}
+
+bool isValidRoomCode(const char* roomCode) {
+    if (strlen(roomCode) != 6) return false;
+    for (int i = 0; i < 6; i++) {
+        if (!isalnum(roomCode[i])) return false;
+    }
+    return true;
+}
+
+void cleanupMultiplayer(MultiplayerSession* session) {
+    if (session->socket != INVALID_SOCKET) {
+        closesocket(session->socket);
+        session->socket = INVALID_SOCKET;
+    }
+    session->isConnected = false;
+    WSACleanup();
 }
